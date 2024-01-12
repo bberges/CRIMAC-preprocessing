@@ -34,6 +34,7 @@ import sys
 import subprocess
 import re
 import dask
+import scipy.ndimage
 import numpy as np
 import xarray as xr
 import zarr as zr
@@ -45,14 +46,13 @@ import datetime
 import gc
 import netCDF4
 
-
+from scipy import interpolate
 from psutil import virtual_memory
-
 
 from annotationtools import readers
 
 from rechunker.api import rechunk
-
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -61,9 +61,75 @@ from matplotlib.colors import LinearSegmentedColormap, Colormap
 import math
 from numcodecs import Blosc
 
+
+
+debug = False
+correctionpath="/dataout/correction"
+
+class Logger(object):
+    def __init__(self, logfile):
+        self.terminal = sys.stdout
+        self.log = open(logfile, "a")
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+
+    def flush(self):
+        # this flush method is needed for python 3 compatibility.
+        # this handles the flush command by doing nothing.
+        # you might want to specify some extra behavior here.
+        pass
+
+class errorLogger(object ):
+    def __init__(self,logfile):
+        self.terminal = sys.stderr
+        self.log = open(logfile, "a")
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+
+    def flush(self):
+        # this flush method is needed for python 3 compatibility.
+        # this handles the flush command by doing nothing.
+        # you might want to specify some extra behavior here.
+        pass
+    
+def getparquetarray(out_filename,raw_fname,dist1 ,column):
+    print(len(dist1))
+    dist3=dist1 
+    loadfile = out_filename+"_pingdistcorrected.parquet"
+    print(loadfile+" "+ raw_fname +" "+ column)
+    fileExist = os.path.exists(loadfile)
+    if fileExist :
+        table = pq.read_table(loadfile)
+        df= table.to_pandas()
+        filter_column = "raw_file"
+        filter_value = raw_fname
+        filtered_df = df.loc[df[filter_column] == filter_value]
+        column_name = column
+        print(df)
+        print(column_name )
+        filtered_col = filtered_df[column_name]
+        dist3 = filtered_col.to_numpy()
+        print(len(dist3))
+    else:
+        print("file not found")
+    return dist3
+
+def interpolate_nan(A):
+    # interpolate to fill nan values (used for distance)
+    inds = np.arange(A.shape[0])
+    good = np.where(np.isfinite(A))
+    f = interpolate.interp1d(inds[good], A[good],bounds_error=False , fill_value='extrapolate')
+    B = np.where(np.isfinite(A),A,f(inds))
+    return B
+
 def append_to_parquet(df, pq_filepath, pq_obj=None):
     # Must set the schema to avoid mismatched schema errors
     fields = [
+        pa.field('ping_index', pa.int64()),
         pa.field('ping_time', pa.timestamp('ns')),
         pa.field('mask_depth_upper', pa.float64()),
         pa.field('mask_depth_lower', pa.float64()),
@@ -71,7 +137,10 @@ def append_to_parquet(df, pq_filepath, pq_obj=None):
         pa.field('acoustic_category', pa.string()),
         pa.field('proportion', pa.float64()),
         pa.field('object_id', pa.string()),
-        pa.field('channel_id', pa.string())
+        pa.field('channel_id', pa.string()),
+        pa.field('upperThreshold', pa.float64()),
+        pa.field('lowerThreshold', pa.float64()),
+        pa.field('raw_file', pa.string())
     ]
     df_schema = pa.schema(fields)
     pa_tbl = pa.Table.from_pandas(df, schema=df_schema, preserve_index=False)
@@ -191,12 +260,20 @@ def plot_all(ds, out_name, range_res = 600, time_res = 800, interpolate = False)
         else:
             sv = ds.sv.coarsen(range = mult_range, ping_time = mult_time, boundary="trim").mean(skipna=True)
 
-    vmin = sv.min(skipna=True).compute()
-    vmax = sv.max(skipna=True).compute()
-
+    #vmin = sv.min(skipna=True).compute()
+    #vmax = sv.max(skipna=True).compute()
+    vmin = sv.dropna(dim='ping_time', how='all').min(skipna=True).compute()
+    vmax = sv.dropna(dim='ping_time', how='all').max(skipna=True).compute()
+    
     # Handle duplicate frequencies
     if len(sv.frequency.data) == len(np.unique(sv.frequency.data)):
-        sv.plot(x="ping_time", y="range", row= "frequency", vmin = vmin, vmax = vmax, norm=colors.LogNorm(), cmap=simrad_cmap)
+        if len(sv.frequency.data) == 1:
+            sv.plot(x="ping_time", y="range", vmin=vmin, vmax=vmax, norm=colors.LogNorm(),
+                    cmap=simrad_cmap)
+        else:
+            sv.plot(x="ping_time", y="range", row="frequency", vmin=vmin, vmax=vmax, norm=colors.LogNorm(),
+                    cmap=simrad_cmap)
+        
     else:
         frstr = ["%.2f" % i for i in sv.frequency.data]
         new_coords = []
@@ -269,8 +346,8 @@ def process_data_to_xr(raw_data, raw_obj=None, get_positions=False):
         e = sys.exc_info()[0]
         print(e)
         print("Setting NaN for angles for this channel")
-        angle_alongship = np.full(sv.shape, np.nan)
-        angle_athwartship = np.full(sv.shape, np.nan)
+        angle_alongship = sv.copy(data = np.full(sv.shape, np.nan))#np.full(sv.shape, np.nan)
+        angle_athwartship = sv.copy(data = np.full(sv.shape, np.nan))# np.full(sv.shape, np.nan)
     else:
         angle_alongship = sv.copy(data = np.expand_dims(ang1.data, axis=0))
         angle_athwartship = sv.copy(data = np.expand_dims(ang2.data, axis=0))
@@ -279,6 +356,23 @@ def process_data_to_xr(raw_data, raw_obj=None, get_positions=False):
         position = raw_obj.nmea_data.interpolate(sv_obj, 'position')
         speed = raw_obj.nmea_data.interpolate(sv_obj, 'speed')
         distance = raw_obj.nmea_data.interpolate(sv_obj, 'distance')
+        for item in distance:
+            if len(item)==2 :
+                if 'trip_distance_nmi' in item:
+                    #print((item))
+                    array_sum = np.sum(item['trip_distance_nmi'])
+                    array_has_nan = np.isnan(array_sum)
+                    print("distance has NaN " + str(array_has_nan))
+                    if array_has_nan:
+                        nancount = np.count_nonzero(np.isnan(item['trip_distance_nmi']))
+                        distancelength = len(item['trip_distance_nmi'])
+                        if distancelength > (nancount + 1):
+                            item['trip_distance_nmi'] = interpolate_nan(item['trip_distance_nmi'])
+                            array_sum = np.sum(item['trip_distance_nmi'])
+                            array_has_nan = np.isnan(array_sum)
+                            print("after fix : distance has NaN " + str(array_has_nan))
+                        else:
+                            print("DISTANCE ERROR : distance has nuber of NaN > distancelength-2 " + str(array_has_nan))
         positions = {"position": position, "speed": speed, "distance": distance}
         return [sv, trdraft, pulse_length, angle_alongship, angle_athwartship, positions]
     else:
@@ -379,15 +473,19 @@ def _regrid(sv_s, W, n_pings):
 def regrid_sv(sv, reference_range):
     print("Channel with frequency " + str(sv.frequency.values[0]) + " range mismatch! Reference range size: " + str(reference_range.size) + " != " + str(sv.range.size))
     # Re-grid this channel sv
+    #    reference_range = xr.DataArray(name="range", data=reference_range, dims=['range'],
+    #                           coords={ 'range': reference_range - reference_range[0]})
     sv_obj = sv[0,]
-    W = _resampleWeight(reference_range.values, sv_obj.range)
-    sv_tmp = _regrid(sv_obj.data.transpose(), W, sv_obj.ping_time.size).transpose()
+    #W = _resampleWeight(reference_range.values, sv_obj.range.values)
+    #sv_tmp = _regrid(sv_obj.data.transpose(), W, sv_obj.ping_time.size).transpose()
+    sv_tmp = scipy.ndimage.zoom(sv_obj.data, zoom=[1,len(reference_range.values)/len(sv_obj.range.values)],order=0)
+    
     # Create new xarray with the same frequency
     sv = xr.DataArray(name="sv", data=np.expand_dims(sv_tmp, axis = 0), dims=['frequency', 'ping_time', 'range'],
                     coords={ 'frequency': sv.frequency,
                             'ping_time': sv.ping_time,
                             'range': reference_range.values,
-                    }) 
+                    })
     return sv
 
 def expand_range(old_range, target, interval):
@@ -449,15 +547,21 @@ def process_channel(raw_data, channel, raw_data_main, reference_range):
 
     return [channel] + sv_bundle
 
-def process_raw_file(raw_fname, main_frequency, reference_range = None):
+def process_raw_file(out_fname,raw_fname, main_frequency, reference_range = None):
     # Read input raw
     print("\n\nNow processing file: " + raw_fname)
     raw_obj = None
     try:
         raw_obj = ek_read(raw_fname)
-    except:
-        e = sys.exc_info()[0]
+        
+    except Exception as e:
+        exc_type, exc_obj, exc_tb = sys.exc_info()
+        fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
         print("ERROR: Something went wrong when reading the RAW file: " + str(raw_fname) + " (" + str(e) + ")")
+        if debug:
+            print( "ERROR: RAW file ")
+            #print(   "ERROR: RAW file " + TypeError   + NameError + ValueError)
+        print(exc_type, fname, exc_tb.tb_lineno)
     print(raw_obj)
 
     # Gracefully continue when raw read result is invalid
@@ -514,17 +618,21 @@ def process_raw_file(raw_fname, main_frequency, reference_range = None):
     positions = sv_bundle[5]['position'][1]
     speed = sv_bundle[5]['speed'][1]
     distance = sv_bundle[5]['distance'][1]
-
+    
+    #sv_bundle[0] = sv_bundle[0].range.assign_coords(range=np.around(sv_bundle[0].range.values, 4))
+    
     # Check whether we need to set a reference range using this file's range or max_range
     if type(reference_range) == type(None):
         reference_range = sv_bundle[0].range
     else:
         # If we need to use the target range
         if isinstance(reference_range, (int, float, complex)) and not isinstance(reference_range, bool):
-            range_intervals = list(a[0]-a[1] for a in zip(sv_bundle[0].range[1:].values, sv_bundle[0].range[:-1].values))
+            #range_intervals = np.around(list(a[0]-a[1] for a in zip(sv_bundle[0].range[1:].values, sv_bundle[0].range[:-1].values)),6)
+            range_intervals = np.diff(sv_bundle[0].range.values)
             unique_range_intervals = np.unique(range_intervals)
             if len(unique_range_intervals) > 1:
                 print("ERROR: Interval is not unique!!!")
+                unique_range_intervals = np.array(unique_range_intervals.item(0))
             reference_range = expand_range(sv_bundle[0].range, reference_range, unique_range_intervals)
 
         # Check if we also need to regrid this main channel
@@ -597,17 +705,24 @@ def process_raw_file(raw_fname, main_frequency, reference_range = None):
         #positions['longitude'] = positions['longitude'][pidx]
         #speed['spd_over_grnd_kts'] = speed['spd_over_grnd_kts'][pidx]
         #distance['trip_distance_nmi'] = distance['trip_distance_nmi'][pidx]
-
+    print("fix distance and ping errors:")
+    
+    filenameraw = os.path.basename(raw_fname)
+    distancenew=getparquetarray(out_fname, filenameraw,distance['trip_distance_nmi'],'distance')
+    pingtimenew=getparquetarray(out_fname, filenameraw,positions['ping_time'],'ping_time')
+    
     # Get position speed distance in a dataset to ease alignments (if needed, as below)
     da_pos = xr.Dataset(
                 data_vars=dict(
-                    distance=(["ping_time"], distance['trip_distance_nmi']),
+                    distance=(["ping_time"], distancenew),
+                    #distanceraw=(["ping_time"], distance['trip_distance_nmi']),
                     speed=(["ping_time"], speed['spd_over_grnd_kts']),
                     latitude=(["ping_time"], positions['latitude']),
-                    longitude=(["ping_time"], positions['longitude'])
+                    longitude=(["ping_time"], positions['longitude']),
+                    #pingtimeraw=(["ping_time"],positions['ping_time'])
                 ),
                 coords=dict(
-                    ping_time = positions['ping_time']
+                    ping_time = pingtimenew
                 )
             )
 
@@ -629,11 +744,13 @@ def process_raw_file(raw_fname, main_frequency, reference_range = None):
             heading=(["ping_time"], obj_heading),
             speed=(["ping_time"], da_pos.speed.data),
             distance=(["ping_time"], da_pos.distance.data),
+            #distanceraw=(["ping_time"], da_pos.distanceraw.data),
+            #ping_time_raw=(["ping_time"], da_pos.pingtimeraw.data),
             pulse_length=(["frequency"], plength_list)
             ),
         coords=dict(
             frequency = da_sv.frequency,
-            ping_time = da_sv.ping_time,
+            ping_time = pingtimenew,
             range = da_sv.range,
             )
     )
@@ -662,6 +779,8 @@ def raw_to_grid_single(raw_fname, main_frequency = 38000, write_output = False, 
             target_fname = out_fname + ".nc"
         elif output_type == "zarr":
             target_fname = out_fname + ".zarr"
+        elif output_type == "parquet":
+            target_fname = out_fname + "_pingdist.temp.parquet"
         else:
             print("Output type is not supported")
             return False
@@ -682,7 +801,7 @@ def raw_to_grid_single(raw_fname, main_frequency = 38000, write_output = False, 
     
     print("Created dataset:")
     print(ds)
-
+    
     if do_write == True:
         if output_type == "netcdf4":
             comp = dict(zlib=True, complevel=5)
@@ -692,6 +811,29 @@ def raw_to_grid_single(raw_fname, main_frequency = 38000, write_output = False, 
             compressor = Blosc(cname='zstd', clevel=3, shuffle=Blosc.BITSHUFFLE)
             encoding = {var: {"compressor" : compressor} for var in ds.data_vars}
             ds.to_zarr(target_fname, mode="w", encoding=encoding)
+        elif output_type == "parquet":
+            print("parquet")
+            
+            
+            savedf = pd.DataFrame(data={'raw_file': ds["raw_file"],
+                                    'distance': ds["distance"],
+                                    'ping_time': ds["ping_time"],
+                                    'speed': ds["speed"],
+                                    'latitude': ds["latitude"],
+                                    'longitude': ds["longitude"] })
+                
+            # Convert if necessary
+            savedf = savedf.astype({'raw_file': str,
+                                    'distance': 'float64',
+                                    'ping_time': 'datetime64[ns]',
+                                    'speed': 'float64',
+                                    'latitude': 'float64',
+                                    'longitude': 'float64'})
+            pq_writer = None
+            pq_filepath = out_fname
+            pq_writer = write_to_parquet(ds, pq_filepath, pq_writer)
+            
+            
         else:
             print("Output type is not supported")
     
@@ -821,6 +963,10 @@ def raw_to_grid_multiple(dir_loc,  work_dir_loc, single_raw_file = 'nofile', mai
             target_fname = out_fname + ".nc"
         elif output_type == "zarr":
             target_fname = out_fname + ".zarr"
+        elif output_type == "parquet":
+            target_fname = out_fname + "_pingdist.temp.parquet"
+            print("making parquet for correction of ping_time and distance")
+            print(target_fname)
         else:
             print("Output type is not supported")
             return None
@@ -865,9 +1011,11 @@ def raw_to_grid_multiple(dir_loc,  work_dir_loc, single_raw_file = 'nofile', mai
         # Nothing to do here
         return None
 
+    pq_writercorrection = None
+    
     # Prepare parquet file path for work file data
     pq_writer = None
-    pq_filepath = out_fname + "_work.parquet"
+    pq_filepath = out_fname + "_labels.parquet"
 
     # For handling new files
     alternative_counter = 1
@@ -876,12 +1024,23 @@ def raw_to_grid_multiple(dir_loc,  work_dir_loc, single_raw_file = 'nofile', mai
         base_fname, _ = os.path.splitext(fn)
 
         # Process single file
-        ds = process_raw_file(dir_loc + "/" + fn, main_frequency, reference_range)
+        ds = process_raw_file(out_fname, dir_loc + "/" + fn, main_frequency, reference_range)
 
         # Continue on invalid data
         if ds is None:
             continue
 
+        pyecholab_version = get_pyecholab_rev()
+        if pyecholab_version is None:
+            pyecholab_version = "local-debug"
+        
+        git_rev = "docker"
+        try:
+            git_rev =  subprocess.check_output(['git', 'rev-parse', 'HEAD']).decode('ascii').strip()
+                
+        except Exception as e:
+            print("error getting git revision")
+        
         # Append version attributes
         ds.attrs = dict(
             name = "CRIMAC-preprocessor",
@@ -889,32 +1048,44 @@ def raw_to_grid_multiple(dir_loc,  work_dir_loc, single_raw_file = 'nofile', mai
             time = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
             version = os.getenv('VERSION_NUMBER', __version__),
             commit_sha = os.getenv('COMMIT_SHA', 'XXXXXXXX'),
-            pyecholab = get_pyecholab_rev()
+            git_revision_hash = git_rev ,
+            pyecholab = pyecholab_version
         )
-
-        # Process work file (if any)
-        work_fname = work_dir_loc + "/" + base_fname + ".work"
-        is_exists_work = os.path.isfile(work_fname)
-        if is_exists_work:
-            idx_fname = dir_loc + "/" + base_fname + ".idx"
-            is_exists_idx = os.path.isfile(idx_fname)
-            if is_exists_idx:
-                # Process work file
-                ann_obj = None
-                try:
-                    work = readers.work_reader(work_fname)
-                    ann_obj = readers.work_to_annotation(work, idx_fname)
-                except:
-                    e = sys.exc_info()[0]
-                    print("ERROR: Something went wrong when reading the WORK file: " + str(work_fname)  + " (" + str(e) + ")")
-                    print(str(e))
-                if ann_obj is not None and ann_obj.df_ is not None:
-                    # Exclude layers for now (only schools and gaps)
-                    # df = ann_obj.df_[ann_obj.df_.priority != 3]
+        if not output_type == "parquet":
+            
+            # Process work file (if any)
+            work_fname = work_dir_loc + "/" + base_fname + ".work"
+            is_exists_work = os.path.isfile(work_fname)
+            if is_exists_work:
+                idx_fname = dir_loc + "/" + base_fname + ".idx"
+                is_exists_idx = os.path.isfile(idx_fname)
+                if is_exists_idx:
+                    # Process work file
+                    ann_obj = None
+                    try:
+                        work = readers.work_reader(work_fname)
+                        ann_obj = readers.work_to_annotation(work, idx_fname)
+                        
+                    except Exception as e:
+                        exception_type, exception_object, exception_traceback = sys.exc_info()
+                        filename = exception_traceback.tb_frame.f_code.co_filename
+                        line_number = exception_traceback.tb_lineno
+                        print("ERROR: - Something went wrong when reading the WORK file"+ str(work_fname))
+                        print("Exception type: ", exception_type)
+                        print("File name: ", filename)
+                        print("Line number: ", line_number)
+                        print("ERROR: - Something went wrong when reading the WORK file: " + str(work_fname) + " (" + str( e) + ")")
+                        
+                        if debug:
+                            print( "ERROR: work file " +str(work_fname)+   NameError + ValueError)
                     
-                    # Layers schools and gaps
-                    df = ann_obj.df_
-                    pq_writer = append_to_parquet(df, pq_filepath, pq_writer)
+                    if ann_obj is not None and ann_obj.df_ is not None:
+                        # Exclude layers for now (only schools and gaps)
+                        # df = ann_obj.df_[ann_obj.df_.priority != 3]
+                        
+                        # Layers schools and gaps
+                        df = ann_obj.df_
+                        pq_writer = append_to_parquet(df, pq_filepath, pq_writer)
 
         if do_write == True:
             if output_type == "netcdf4":
@@ -934,7 +1105,7 @@ def raw_to_grid_multiple(dir_loc,  work_dir_loc, single_raw_file = 'nofile', mai
                     reference_range = ds.range
             elif output_type == "zarr":
                 # Re-chunk so that we have a full range in a chunk (zarr only)
-                ds = ds.chunk({"frequency": 1, "range": ds.range.shape[0], "ping_time": 'auto'})
+                ds = ds.chunk({"frequency": 1, "range": ds.range.shape[0]})#, "ping_time": 'auto'
                 # Encode zarr output
                 compressor = Blosc(cname='zstd', clevel=3, shuffle=Blosc.BITSHUFFLE)
                 encoding = {var: {"compressor" : compressor} for var in ds.data_vars}
@@ -950,6 +1121,28 @@ def raw_to_grid_multiple(dir_loc,  work_dir_loc, single_raw_file = 'nofile', mai
                     ds.to_zarr(target_fname, mode="w", encoding=encoding)
                     # Propagate range to the rest of the files
                     reference_range = ds.range
+            elif output_type == "parquet":
+                
+                savedf = pd.DataFrame(data={'raw_file': ds["raw_file"],
+                                    'distance': ds["distance"],
+                                    'ping_time': ds["ping_time"],
+                                    'speed': ds["speed"],
+                                    'latitude': ds["latitude"],
+                                    'longitude': ds["longitude"] })
+                
+                # Convert if necessary
+                savedf = savedf.astype({'raw_file': str,
+                                    'distance': 'float64',
+                                    'ping_time': 'datetime64[ns]',
+                                    'speed': 'float64',
+                                    'latitude': 'float64',
+                                    'longitude': 'float64'})
+                
+                pq_filepath =  target_fname
+                pq_writercorrection  = write_to_parquet(savedf, pq_filepath, pq_writercorrection )
+                
+                
+                
             else:
                 print("Output type is not supported")
 
@@ -961,6 +1154,29 @@ def raw_to_grid_multiple(dir_loc,  work_dir_loc, single_raw_file = 'nofile', mai
         print(gc.collect())
         print(gc.get_count())
     return True
+
+def write_to_parquet(df, pq_filepath, pq_obj=None):
+    # Must set the schema to avoid mismatched schema errors
+    fields = [ 
+ 
+        pa.field('raw_file', pa.string()),
+        pa.field('distance', pa.float64()),
+        pa.field('ping_time', pa.timestamp('ns')),
+        pa.field('speed', pa.float64()),
+        pa.field('latitude', pa.float64()),
+        pa.field('longitude', pa.float64())
+        #pa.float64()
+    ]
+    # pa.timestamp('ns')
+     
+    print(df)
+    df_schema = pa.schema(fields)
+
+    pa_tbl = pa.Table.from_pandas(df, schema=df_schema, preserve_index=False)
+    if pq_obj == None:
+        pq_obj = pq.ParquetWriter(pq_filepath, pa_tbl.schema)
+    pq_obj.write_table(table=pa_tbl)
+    return pq_obj
 
 def get_pyecholab_rev():
     reqs = subprocess.check_output([sys.executable, '-m', 'pip', 'freeze'])
@@ -1023,27 +1239,26 @@ def rechunk_output(output, output_dir):
     shutil.rmtree(tmp_file)
     [shutil.rmtree(fil) for fil in glob.glob(output + "_*.zarr")]
 
-if __name__ == '__main__':
-    # Default input raw dir
-    raw_dir = os.path.expanduser("/datain")
-
-    # Default input work dir
-    work_dir = os.path.expanduser("/workin")
-
+def parsedata(rawdir, workdir, outdir, OUTPUT_TYPE, OUTPUT_NAME, MAX_RANGE_SRC, MAIN_FREQ, RAW_FILE='nofile',
+              WRITE_PNG='0', LOGGING='1', DEBUGMODE='0'):
+    raw_dir = rawdir
+    work_dir = workdir
+    out_dir =outdir
+    correctionpath = out_dir + '/' + "correction"
     # Get the output type
-    out_type = os.getenv('OUTPUT_TYPE', 'zarr')
-    
+    out_type = OUTPUT_TYPE
+
     # raw_file for processing single files
-    raw_file = os.getenv('RAW_FILE', 'nofile')
-    
+    raw_file = RAW_FILE
+
     # Get the output name
-    out_name = os.path.expanduser("/dataout") + '/' + os.getenv('OUTPUT_NAME', 'out')
+    out_name = out_dir + '/' + OUTPUT_NAME
 
     # Get the range determination type (numeric, 'auto', or None)
     # A numeric type will force the range steps to be equal to the specified number
     # 'auto' will force the range steps to be equal to the maximum range steps of all the processed files
     # None will use the first file's main channel's range steps
-    max_ref_ran = os.getenv('MAX_RANGE_SRC', 'None')
+    max_ref_ran = MAX_RANGE_SRC
     if max_ref_ran != "auto":
         try:
             max_ref_ran = int(max_ref_ran)
@@ -1053,7 +1268,7 @@ if __name__ == '__main__':
             max_ref_ran = None
 
     # Get the frequency for the main channel
-    main_freq = os.getenv('MAIN_FREQ', '38000')
+    main_freq = MAIN_FREQ
     try:
         main_freq = int(main_freq)
     except ValueError as verr:
@@ -1062,38 +1277,47 @@ if __name__ == '__main__':
         main_freq = 38000
 
     # Get whether we should produce an overview image
-    do_plot = os.getenv('WRITE_PNG', '0')
+    do_plot = WRITE_PNG
     if do_plot == '1':
         do_plot = True
     else:
         do_plot = False
 
+    if LOGGING == '1':
+        sys.stderr = errorLogger(out_name + "-errorlog.txt")
+        sys.stdout = Logger(out_name + "-log.txt")
+
+    global debug
+    if DEBUGMODE == '1':
+        debug = True
+    else:
+        debug = False
+
     # If number of workers is specified
-    #n_workers = int(os.getenv('N_WORKERS', '2'))
+    # n_workers = int(os.getenv('N_WORKERS', '2'))
     n_workers = 1
 
     # Get total memory
     mem = virtual_memory()
     # Get maximum memory that can be used (total/2)
-    mem_use = (mem.total/2)/n_workers
+    mem_use = (mem.total / 2) / n_workers
 
     # Setting up dask
-    tmp_dir = os.path.expanduser('/dataout/tmp')
-    
+    tmp_dir =  os.path.expanduser(out_dir+'/tmp')
     # Do process
     status = raw_to_grid_multiple(raw_dir,
-                            work_dir_loc = work_dir,
-                            single_raw_file = raw_file,
-                            main_frequency = main_freq,
-                            write_output = True,
-                            out_fname = out_name,
-                            output_type = out_type,
-                            overwrite = False,
-                            resume = True,
-                            max_reference_range = max_ref_ran)
+                                  work_dir_loc=work_dir,
+                                  single_raw_file=raw_file,
+                                  main_frequency=main_freq,
+                                  write_output=True,
+                                  out_fname=out_name,
+                                  output_type=out_type,
+                                  overwrite=False,
+                                  resume=True,
+                                  max_reference_range=max_ref_ran)
 
     # Cleaning up Dask
-    #client.close()
+    # client.close()
     if os.path.exists(tmp_dir):
         shutil.rmtree(tmp_dir)
 
@@ -1101,31 +1325,89 @@ if __name__ == '__main__':
 
     # Post processing: rechunk Zarr files
     if status is True and out_type == "zarr":
-        rechunk_output(out_name, os.path.expanduser("./dataout"))
+        rechunk_output(out_name, out_dir)
 
     # Post-processing: appending a unique ID and pyecholab rev
     if status is True:
         if out_type == "netcdf4":
             ds = xr.open_dataset(out_name + ".nc")
-            ds_id =  ds
+            ds_id = ds
             ds.close()
             with netCDF4.Dataset(out_name + ".nc", mode='a') as nc:
                 nc.id = ds_id
-        else:
+        elif out_type == "zarr":
             ds = xr.open_zarr(out_name + ".zarr")
-            #ds_id = dask.base.tokenize(ds)
-            ds_id = ds  
+            # ds_id = dask.base.tokenize(ds)
+            ds_id = ds
             ds.close()
             zro = zr.open(out_name + ".zarr")
             zro_attrs = zro.attrs.asdict()
             print(zro_attrs)
-            #fix lines below after dask renoval
-            #zro_attrs["id"] = ds_id
-            #zro.attrs.put(zro_attrs)
+            # fix lines below after dask renoval
+            # zro_attrs["id"] = ds_id
+            # zro.attrs.put(zro_attrs)
 
-    if status == True and do_plot == True:
-        if out_type == "netcdf4":
-            ds = xr.open_dataset(out_name + ".nc")
-        else:
-            ds = xr.open_zarr(out_name + ".zarr", chunks={'ping_time':'auto'})
-        plot_all(ds, out_name)
+    try:
+        if status == True and do_plot == True:
+            if out_type == "netcdf4":
+                ds = xr.open_dataset(out_name + ".nc")
+                plot_all(ds, out_name)
+            elif out_type == "zarr":
+                ds = xr.open_zarr(out_name + ".zarr", chunks={'ping_time': 'auto'})
+                plot_all(ds, out_name)
+
+    except Exception as e:
+
+        exception_type, exception_object, exception_traceback = sys.exc_info()
+        filename = exception_traceback.tb_frame.f_code.co_filename
+        line_number = exception_traceback.tb_lineno
+        print("ERROR: - Something went wrong when plotting zarr file " + str(out_name))
+        print("Exception type: ", exception_type)
+        print("File name: ", filename)
+        print("Line number: ", line_number)
+        print("ERROR: - Something went wrong when plotting zarr file : " + str(out_name) + " (" + str(e) + ")")
+
+    
+    # consolidate zarr and rename files
+    if out_type == "netcdf4":
+        os.system("mv " + out_name + ".nc " + out_name + "_sv.nc")
+    elif out_type == "zarr":
+        zr.consolidate_metadata(out_name + ".zarr")
+        os.system("mv " + out_name + ".zarr " + out_name + "_sv.zarr")
+    elif out_type == "parquet":
+        os.system("mv " + out_name + "_pingdist.temp.parquet " + out_name + "_pingdist.parquet")
+        correct_parquet(out_name + "_pingdist.parquet")
+        
+
+def writelabels(rawdir, workdir, outdir, OUTPUT_NAME, shipID='shipID', parselayers='0'):
+    svzarrfile= outdir + '/' + OUTPUT_NAME  +"_sv.zarr"
+    pq_filepath=outdir + '/' + OUTPUT_NAME  +"_labels.parquet"
+    parser = ParseWorkFiles(rawdir=rawdir, workdir=workdir, pq_filepath=pq_filepath,svzarr_file=svzarrfile)
+    parser.run()
+    
+    
+    labelszarrfile= outdir + '/' + OUTPUT_NAME +"_labels.zarr"
+    labelsZarr = WriteLabelsZarr(shipID=shipID, svzarrfile=svzarrfile, parquetfile=pq_filepath, savefile=labelszarrfile, pingchunk=40000,  parselayers=0)
+    labelsZarr.run()
+        
+if __name__ == '__main__':
+    runtype = os.getenv('OUTPUT_TYPE', 'zarr')
+    if(runtype ==  "labels.zarr"):
+        writelabels(rawdir = os.path.expanduser("/datain"),
+              workdir = os.path.expanduser("/workin"),
+              outdir = os.path.expanduser("/dataout"),
+              OUTPUT_NAME = os.getenv('OUTPUT_NAME', 'out'),
+              shipID=os.getenv('shipID', 'shipID') ,
+              parselayers=os.getenv('parselayers', '0'))
+    else:
+        parsedata(rawdir = os.path.expanduser("/datain"),
+              workdir = os.path.expanduser("/workin"),
+              outdir = os.path.expanduser("/dataout"),
+              OUTPUT_TYPE = os.getenv('OUTPUT_TYPE', 'zarr'),
+              OUTPUT_NAME = os.getenv('OUTPUT_NAME', 'out'),
+              MAX_RANGE_SRC = os.getenv('MAX_RANGE_SRC', 'None'),
+              MAIN_FREQ = os.getenv('MAIN_FREQ', '38000'),
+              RAW_FILE = os.getenv('RAW_FILE', 'nofile'),
+              WRITE_PNG = os.getenv('WRITE_PNG', '0'),
+              LOGGING = os.getenv('LOGGING', '1'),
+              DEBUGMODE = os.getenv('DEBUG', '0') )
