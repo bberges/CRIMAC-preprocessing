@@ -9,7 +9,7 @@ with open('requirements.txt') as file:
     requirements = [line.strip() for line in file.readlines() if not line.startswith('git+')]
 
 setuptools.setup(
-    name=' CRIMAC-preprocessing',
+    name='CRIMAC-preprocessing',
     version='0.0.1',
     description='preprocessing script, forked from CRIMAC',
     long_description=long_description,
@@ -20,4 +20,6 @@ setuptools.setup(
         'License :: OSI Approved :: MIT License',
         'Operating System :: OS Independent',
     ],
+    packages=setuptools.find_packages(),
+    install_requires=requirements,
 )
