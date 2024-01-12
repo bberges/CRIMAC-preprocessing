@@ -9,7 +9,7 @@ dask[distributed]
 dask[dataframe]
 pandas
 pyarrow
-xarra
+xarray
 rechunker
 numcodecs
 numpy
